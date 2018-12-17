@@ -18,78 +18,117 @@ contract Owned {
         emit LogOwnerChanged(owner, newOwner);
         owner = newOwner;
     }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner);
+        _;
+    }
 }
 
-contract Splitter is Owned {
-    address public alice;
-    address payable public bob;
-    uint public bobBalance;
-    address payable public carol;
-    uint public carolBalance;
+contract Pausable is Owned {
+    bool private isRunning;
 
-    event LogAliceAddressChanged(address indexed previousAlice, address newAlice);
-    event LogBobAddressChanged(address indexed previousBob, address newBob);
-    event LogCarolAddressChanged(address indexed previousCarol, address newCarol);
-    event LogEtherSplit(address indexed payer, uint amount);
-    event LogWithdrawal(address indexed payee, uint amount);
+    event LogContractPaused(address sender);
+    event LogContractResumed(address sender);
 
     constructor() public {
-
+        isRunning = true;
     }
 
-    function canChange(address toChange) public view returns (bool) {
-        return (msg.sender == toChange) || (msg.sender == super.getOwner());
+    modifier onlyIfRunning() {
+        require(isRunning);
+        _;
     }
 
-    function setAlice(address newAddress) public {
-        require(canChange(alice));
-        emit LogAliceAddressChanged(alice, newAddress);
-        alice = newAddress;
+    function pauseContract() public onlyOwner {
+        isRunning = false;
+        emit LogContractPaused(msg.sender);
     }
 
-    function setBob(address payable newAddress) public {
-        require(canChange(bob));
-        emit LogBobAddressChanged(bob, newAddress);
-        bob = newAddress;
+    function resumeContract() public onlyOwner {
+        isRunning = true;
+        emit LogContractResumed(msg.sender);
+    }
+}
+
+contract Splitter is Pausable {
+    struct Recipient {
+        uint balance;
+        uint index;
+    }
+    address[] private recipientList;
+    mapping(address => Recipient) recipientStructs;
+
+    event LogEtherSplit(address indexed payer, uint amount, address recipientA, address recipientB);
+    event LogRemainderReturned(address indexed payer);
+    event LogWithdrawal(address indexed recipient, uint amount);
+    event LogNewRecipient(address indexed recipient, uint balance, uint index);
+    event LogUpdatedRecipient(address indexed recipient, uint balance, uint index);
+
+    function isRecipient(address a) public view returns (bool isIndeed) {
+        if (recipientList.length == 0) return false;
+
+        return (recipientList[recipientStructs[a].index] == a);
     }
 
-    function setCarol(address payable newAddress) public {
-        require(canChange(carol));
-        emit LogCarolAddressChanged(carol, newAddress);
-        carol = newAddress;
+    function insertRecipient(address a, uint _balance) private returns (uint index) {
+        require(!isRecipient(a));
+        recipientStructs[a].balance = _balance;
+        recipientStructs[a].index = recipientList.push(a) - 1;
+        emit LogNewRecipient(a, _balance, recipientStructs[a].index);
+        return recipientList.length - 1;
     }
 
-    function split() public payable {
-        require(msg.sender == alice);
+    function updateRecipientBalance(address a, uint newBalance) private returns (bool success) {
+        require(isRecipient(a));
+        recipientStructs[a].balance = newBalance;
+        emit LogUpdatedRecipient(a, newBalance, recipientStructs[a].index);
+        return true;
+    }
+
+    function getRecipient(address a) public view returns (uint balance, uint index) {
+        require(isRecipient(a));
+        return (recipientStructs[a].balance, recipientStructs[a].index);
+    }
+
+    function getRecipientCount() public view returns (uint count) {
+        return recipientList.length;
+    }
+
+    function getRecipientAtIndex(uint index) public view returns (address a) {
+        return recipientList[index];
+    }
+
+    function deposit(address a, uint amount) private returns (bool success) {
+        if (!isRecipient(a)) {
+            // create new account if doesn't exist
+            insertRecipient(a, amount);
+        } else {
+            updateRecipientBalance(a, recipientStructs[a].balance + amount);
+            assert(recipientStructs[a].balance >= amount); // check for overflow
+        }
+        return true;
+    }
+
+    function split(address a, address b) public onlyIfRunning payable {
         require(msg.value > 0);
 
-        emit LogEtherSplit(msg.sender, msg.value);
+        emit LogEtherSplit(msg.sender, msg.value, a, b);
         uint splitAmount = msg.value >> 1; // divide by 2, bitwise
+        if (msg.value % 2 == 1) {
+            msg.sender.transfer(1); // return extra wei if tx value was odd
+            emit LogRemainderReturned(msg.sender);
+        }
 
-        bobBalance += splitAmount;
-        assert(bobBalance >= splitAmount);
-
-        carolBalance += (splitAmount + (msg.value & uint(1))); // give carol the extra wei if there is a remainder
-        assert(carolBalance >= splitAmount);
+        deposit(a, splitAmount);
+        deposit(b, splitAmount);
     }
 
-    function withdraw() external {
-        uint amount;
-
-        if (msg.sender == bob) {
-            amount = bobBalance;
-            bobBalance = 0;
-        } else if (msg.sender == carol) {
-            amount = carolBalance;
-            carolBalance = 0;
-        } else if (msg.sender == super.getOwner()) {
-            // owner will withdraw all remaining contract funds
-            amount = address(this).balance;
-            bobBalance = 0;
-            carolBalance = 0;
-        } else revert();
-
-        emit LogWithdrawal(msg.sender, amount);
+    function withdraw() public onlyIfRunning {
+        require(isRecipient(msg.sender));
+        uint amount = recipientStructs[msg.sender].balance;
+        updateRecipientBalance(msg.sender, 0);
         msg.sender.transfer(amount);
+        emit LogWithdrawal(msg.sender, amount);
     }
 }
